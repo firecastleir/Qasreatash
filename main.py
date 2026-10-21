@@ -36,6 +36,23 @@ def duration(path):
 
 
 _MODELS = None
+_ALL = None
+
+
+def list_models():
+    global _ALL
+    if _ALL is None:
+        _ALL = []
+        try:
+            r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                             params={"key": GEMINI_API_KEY, "pageSize": 200}, timeout=60)
+            r.raise_for_status()
+            for m in r.json().get("models", []):
+                if "generateContent" in m.get("supportedGenerationMethods", []):
+                    _ALL.append(m["name"].split("/")[-1])
+        except Exception as e:
+            print("model list failed:", e)
+    return _ALL
 
 
 def candidate_models():
@@ -43,18 +60,8 @@ def candidate_models():
     global _MODELS
     if _MODELS is not None:
         return _MODELS
-    names = []
-    try:
-        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                         params={"key": GEMINI_API_KEY, "pageSize": 200}, timeout=60)
-        r.raise_for_status()
-        for m in r.json().get("models", []):
-            n = m["name"].split("/")[-1]
-            if ("generateContent" in m.get("supportedGenerationMethods", []) and "flash" in n
-                    and not any(x in n for x in ("image", "tts", "live", "audio", "thinking", "robotics", "computer", "embed", "native"))):
-                names.append(n)
-    except Exception as e:
-        print("model list failed:", e)
+    names = [n for n in list_models() if "flash" in n and not any(
+        x in n for x in ("image", "tts", "live", "audio", "thinking", "robotics", "computer", "embed", "native"))]
 
     def ver(n):
         m = re.search(r"(\d+(?:\.\d+)?)", n)
@@ -135,7 +142,7 @@ def write_article(topic):
 - ساختار: مقدمه، چند h2 با زیرتیتر h3 در صورت نیاز، لیست‌ها، نتیجه‌گیری. تگ h1 نگذار.
 - در انتها دعوت به مشاوره با {BRAND} بیاور (بدون شماره تلفن؛ شماره را سیستم اضافه می‌کند).
 - ۲ تا ۳ لینک داخلی فقط از این فهرست و فقط اگر مرتبط‌اند، با تگ a: {json.dumps(internal, ensure_ascii=False)}
-- متن روایت ویدیو (narration): ۹۰ تا ۱۲۰ کلمه، گفتاری و طبیعی برای گوینده، جمله‌های کوتاه، با نقطه تمام‌شونده، بدون ایموجی و علامت خاص، بدون آدرس سایت و شماره. شروع جذاب و پایان با دعوت به مشاوره با {BRAND}.
+- متن روایت ویدیو (narration): ۹۰ تا ۱۲۰ کلمه، گفتاری و طبیعی برای گوینده، جمله‌های کوتاه (هر جمله حداکثر ۱۵ کلمه)، با نقطه تمام‌شونده. برای خوانده‌شدن درست توسط موتور تبدیل متن به گفتار: همه عددها را با حروف بنویس، هیچ کلمه انگلیسی، مخفف، علامت و ایموجی نیاور، از کلمه‌های ساده و رایج فارسی محاوره‌ای-معیار استفاده کن و املای استاندارد با نیم‌فاصله درست بنویس. بدون آدرس سایت و شماره. شروع جذاب و پایان با دعوت به مشاوره با {BRAND}.
 
 فقط JSON با این کلیدها:
 title (حداکثر ۶۰ کاراکتر، شامل کلمه کلیدی), slug (انگلیسی کوچک با خط تیره), meta_description (۱۲۰ تا ۱۵۵ کاراکتر شامل کلمه کلیدی),
@@ -207,8 +214,74 @@ def split_sentences(text, max_parts=8):
     return merged
 
 
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "fa-IR-DilaraNeural")  # صدای زن
+EDGE_RATE = os.environ.get("EDGE_RATE", "-8%")
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Aoede")  # صدای زن طبیعی‌تر
+
+
 async def tts(text, path):
-    await edge_tts.Communicate(text, VOICE, rate=VOICE_RATE).save(str(path))
+    await edge_tts.Communicate(text, EDGE_VOICE, rate=EDGE_RATE).save(str(path))
+
+
+def gemini_tts(text, pcm_path, wav_path):
+    """صدای طبیعی‌تر با Gemini TTS. اگر خطا داد، برنامه خودش به edge-tts برمی‌گردد."""
+    import base64
+    models = [n for n in list_models() if "tts" in n]
+    if not models:
+        raise RuntimeError("no gemini tts model available")
+    prompt = ("Read aloud in Persian (Iran, standard Tehran accent), in a warm, natural, friendly "
+              "female narrator voice, at a calm medium pace, with natural pauses. Text:\n" + text)
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}}}}}
+    last = None
+    for model in models[:3]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(3):
+            try:
+                r = requests.post(url, params={"key": GEMINI_API_KEY}, json=body, timeout=240)
+                if r.status_code == 429:
+                    print("tts rate limit, waiting")
+                    time.sleep(45)
+                    continue
+                r.raise_for_status()
+                part = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+                rate = 24000
+                m = re.search(r"rate=(\d+)", part.get("mimeType", ""))
+                if m:
+                    rate = int(m.group(1))
+                Path(pcm_path).write_bytes(base64.b64decode(part["data"]))
+                run(["ffmpeg", "-y", "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", str(pcm_path),
+                     "-ar", "44100", "-ac", "1", "-af", "apad=pad_dur=0.35", str(wav_path)])
+                return
+            except Exception as e:
+                last = e
+                print("gemini tts retry", model, attempt, str(e)[:200])
+                time.sleep(6)
+    raise RuntimeError(f"gemini tts failed: {last}")
+
+
+def synth_all(sentences, work):
+    segments = []
+    if os.environ.get("USE_GEMINI_TTS", "1") != "0":
+        try:
+            for i, s in enumerate(sentences):
+                wav = work / f"a{i}.wav"
+                gemini_tts(s, work / f"a{i}.pcm", wav)
+                segments.append((s, wav.name, duration(wav)))
+                time.sleep(3)
+            print("voice: gemini tts")
+            return segments
+        except Exception as e:
+            print("gemini tts failed, falling back to edge-tts:", str(e)[:300])
+            segments = []
+    for i, s in enumerate(sentences):
+        mp3, wav = work / f"a{i}.mp3", work / f"a{i}.wav"
+        asyncio.run(tts(s, mp3))
+        run(["ffmpeg", "-y", "-i", str(mp3), "-ar", "44100", "-ac", "1", "-af", "apad=pad_dur=0.35", str(wav)])
+        segments.append((s, wav.name, duration(wav)))
+    print("voice: edge-tts", EDGE_VOICE)
+    return segments
 
 
 def ass_time(t):
@@ -267,12 +340,7 @@ def build_video(work, segments, images, W, H, out_name):
 
 def make_videos(narration, image_infos, work):
     sentences = split_sentences(narration)
-    segments = []
-    for i, s in enumerate(sentences):
-        mp3, wav = work / f"a{i}.mp3", work / f"a{i}.wav"
-        asyncio.run(tts(s, mp3))
-        run(["ffmpeg", "-y", "-i", str(mp3), "-ar", "44100", "-ac", "1", "-af", "apad=pad_dur=0.35", str(wav)])
-        segments.append((s, wav.name, duration(wav)))
+    segments = synth_all(sentences, work)
     (work / "alist.txt").write_text("".join(f"file '{w}'\n" for _, w, _ in segments))
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "alist.txt", "-c", "copy", "audio.wav"], cwd=work)
     imgs = []
